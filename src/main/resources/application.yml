@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+spring:
+  mongodb:
+    uri: mongodb://localhost:27019/bank
+  datasource:
+    url: jdbc:postgresql://localhost:5433/bank
+    username: bank
+    password: bank
+  docker:
+    compose:
+      lifecycle-management: start-only
+
+bank:
+  snapshot-every: 3
+  projection-poll-interval: 50ms

@@ -1,0 +1,53 @@
+### Abrir conta
+POST http://localhost:8080/accounts
+Content-Type: application/json
+
+{"accountId": "ACC-1", "owner": "Diego"}
+
+### Depositar
+POST http://localhost:8080/accounts/ACC-1/deposits
+Content-Type: application/json
+
+{"amount": 1000}
+
+### Sacar
+POST http://localhost:8080/accounts/ACC-1/withdrawals
+Content-Type: application/json
+
+{"amount": 300}
+
+### Encerrar
+POST http://localhost:8080/accounts/ACC-1/close
+
+### Resumo (read model)
+GET http://localhost:8080/accounts/ACC-1
+
+### Resumo exigindo versao minima (read-your-writes)
+GET http://localhost:8080/accounts/ACC-1?minVersion=3
+
+### Extrato (read model)
+GET http://localhost:8080/accounts/ACC-1/statement
+
+### Historico de eventos (event store)
+GET http://localhost:8080/accounts/ACC-1/events
+
+### Ranking por saldo
+GET http://localhost:8080/rankings/balance?limit=5
+
+### Estado das projecoes (checkpoint e lag)
+GET http://localhost:8080/admin/projections
+
+### Rebuild de uma projecao (apaga read model e reprocessa o historico)
+POST http://localhost:8080/admin/projections/statement/rebuild
+
+### Transferencia (saga)
+POST http://localhost:8080/transfers
+Content-Type: application/json
+
+{"transferId": "TR-1", "sourceAccountId": "ACC-1", "targetAccountId": "ACC-2", "amount": 100}
+
+### Status da transferencia (read model)
+GET http://localhost:8080/transfers/TR-1
+
+### Eventos da conta de origem (ver TransferDebited / TransferDebitReversed)
+GET http://localhost:8080/accounts/ACC-1/events

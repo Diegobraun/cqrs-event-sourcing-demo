@@ -1,0 +1,34 @@
+services:
+  mongo:
+    image: mongo:8
+    container_name: cqrs-bank-mongo
+    labels:
+      org.springframework.boot.ignore: "true"
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27019"]
+    environment:
+      MONGO_INITDB_DATABASE: bank
+    ports:
+      - "27019:27019"
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --port
+        - "27019"
+        - --quiet
+        - --eval
+        - "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27019'}]}).ok }"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: cqrs-bank-postgres
+    environment:
+      POSTGRES_DB: bank
+      POSTGRES_USER: bank
+      POSTGRES_PASSWORD: bank
+    ports:
+      - "5433:5432"
