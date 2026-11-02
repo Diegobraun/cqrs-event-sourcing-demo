@@ -7,6 +7,7 @@ import bank.domain.account.TransferCredited;
 import bank.domain.account.TransferDebitReversed;
 import bank.domain.account.TransferDebited;
 import bank.domain.transfer.TransferCompleted;
+import bank.domain.transfer.TransferCreditStarted;
 import bank.domain.transfer.TransferFailed;
 import bank.domain.transfer.TransferRequested;
 
@@ -17,10 +18,10 @@ public final class TransferProjection implements Projection {
     private static final Map<String, Integer> STAGE = Map.of(
             "REQUESTED", 0,
             "DEBITED", 1,
-            "CREDITED", 2,
-            "REVERSED", 2,
-            "COMPLETED", 3,
-            "FAILED", 3);
+            "CREDITING", 2,
+            "CREDITED", 3,
+            "COMPLETED", 4,
+            "FAILED", 4);
 
     private final TransferViewStore store;
 
@@ -39,14 +40,17 @@ public final class TransferProjection implements Projection {
             case TransferRequested e -> {
                 if (store.find(e.aggregateId()).isEmpty()) {
                     store.save(new TransferView(e.aggregateId(), e.sourceAccountId(), e.targetAccountId(), e.amount(),
-                            "REQUESTED", null, e.occurredAt()));
+                            "REQUESTED", null, false, e.expiresAt(), e.occurredAt()));
                 }
             }
             case TransferDebited e -> advance(e.transferId(), "DEBITED", null, e.occurredAt());
+            case TransferCreditStarted e -> advance(e.aggregateId(), "CREDITING", null, e.occurredAt());
             case TransferCredited e -> advance(e.transferId(), "CREDITED", null, e.occurredAt());
-            case TransferDebitReversed e -> advance(e.transferId(), "REVERSED", e.reason(), e.occurredAt());
             case TransferCompleted e -> advance(e.aggregateId(), "COMPLETED", null, e.occurredAt());
             case TransferFailed e -> advance(e.aggregateId(), "FAILED", e.reason(), e.occurredAt());
+            case TransferDebitReversed e -> store.find(e.transferId())
+                    .filter(current -> !current.refunded())
+                    .ifPresent(current -> store.save(current.markRefunded(e.occurredAt())));
             default -> {
             }
         }
@@ -59,7 +63,7 @@ public final class TransferProjection implements Projection {
 
     private void advance(String transferId, String status, String reason, Instant at) {
         store.find(transferId)
-                .filter(current -> STAGE.get(status) > STAGE.get(current.status()))
+                .filter(current -> STAGE.get(status) > STAGE.getOrDefault(current.status(), 0))
                 .ifPresent(current -> store.save(current.advance(status, reason, at)));
     }
 }

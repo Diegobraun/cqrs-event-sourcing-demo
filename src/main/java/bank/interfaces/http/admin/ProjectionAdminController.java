@@ -30,4 +30,16 @@ public class ProjectionAdminController {
         projections.rebuild(name);
         return ResponseEntity.accepted().build();
     }
+
+    @PostMapping("/{name}/pause")
+    public ResponseEntity<Void> pause(@PathVariable String name) {
+        projections.pause(name);
+        return ResponseEntity.accepted().build();
+    }
+
+    @PostMapping("/{name}/resume")
+    public ResponseEntity<Void> resume(@PathVariable String name) {
+        projections.resume(name);
+        return ResponseEntity.accepted().build();
+    }
 }

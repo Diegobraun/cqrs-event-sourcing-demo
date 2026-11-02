@@ -8,13 +8,12 @@ import bank.application.command.ReverseTransferDebit;
 import bank.application.eventstore.EventEnvelope;
 import bank.application.eventstore.EventSubscriber;
 import bank.domain.account.TransferCredited;
-import bank.domain.account.TransferDebitReversed;
 import bank.domain.account.TransferDebited;
 import bank.domain.shared.DomainException;
 import bank.domain.transfer.Transfer;
+import bank.domain.transfer.TransferFailed;
 import bank.domain.transfer.TransferRequested;
-
-import java.util.Optional;
+import bank.domain.transfer.TransferStatus;
 
 public final class TransferSaga implements EventSubscriber {
     private final TransferRepository transfers;
@@ -37,36 +36,58 @@ public final class TransferSaga implements EventSubscriber {
     public void handle(EventEnvelope envelope) {
         switch (envelope.event()) {
             case TransferRequested e -> debitSource(e.aggregateId());
-            case TransferDebited e -> creditTarget(e.transferId());
+            case TransferDebited e -> afterDebit(e.transferId());
             case TransferCredited e -> transferCommands.complete(e.transferId());
-            case TransferDebitReversed e -> transferCommands.fail(e.transferId(), e.reason());
+            case TransferFailed e -> refundSource(e.aggregateId(), e.reason());
             default -> {
             }
         }
     }
 
     private void debitSource(String transferId) {
-        pendingTransfer(transferId).ifPresent(transfer -> {
-            try {
-                accountCommands.handle(new DebitForTransfer(transfer.sourceAccountId(), transferId, transfer.amount()));
-            } catch (DomainException | CommandRejectedException e) {
-                transferCommands.fail(transferId, "Debito recusado: " + e.getMessage());
-            }
-        });
+        Transfer transfer = load(transferId);
+        if (transfer.status() != TransferStatus.REQUESTED) {
+            return;
+        }
+        try {
+            accountCommands.handle(new DebitForTransfer(transfer.sourceAccountId(), transferId, transfer.amount()));
+        } catch (DomainException | CommandRejectedException e) {
+            transferCommands.fail(transferId, "Debito recusado: " + e.getMessage());
+        }
     }
 
-    private void creditTarget(String transferId) {
-        pendingTransfer(transferId).ifPresent(transfer -> {
-            try {
-                accountCommands.handle(new CreditForTransfer(transfer.targetAccountId(), transferId, transfer.amount()));
-            } catch (DomainException | CommandRejectedException e) {
-                accountCommands.handle(new ReverseTransferDebit(transfer.sourceAccountId(), transferId,
-                        transfer.amount(), "Credito recusado: " + e.getMessage()));
+    private void afterDebit(String transferId) {
+        Transfer transfer = load(transferId);
+        switch (transfer.status()) {
+            case REQUESTED, CREDITING -> creditTarget(transfer);
+            case FAILED -> refundSource(transferId, transfer.failureReason());
+            case COMPLETED -> {
             }
-        });
+        }
     }
 
-    private Optional<Transfer> pendingTransfer(String transferId) {
-        return transfers.load(transferId).filter(Transfer::isPending);
+    private void creditTarget(Transfer transfer) {
+        if (!transferCommands.startCredit(transfer.id())) {
+            return;
+        }
+        try {
+            accountCommands.handle(new CreditForTransfer(transfer.targetAccountId(), transfer.id(), transfer.amount()));
+        } catch (DomainException | CommandRejectedException e) {
+            transferCommands.fail(transfer.id(), "Credito recusado: " + e.getMessage());
+        }
+    }
+
+    private void refundSource(String transferId, String reason) {
+        Transfer transfer = load(transferId);
+        try {
+            accountCommands.handle(new ReverseTransferDebit(transfer.sourceAccountId(), transferId,
+                    transfer.amount(), reason));
+        } catch (CommandRejectedException e) {
+            return;
+        }
+    }
+
+    private Transfer load(String transferId) {
+        return transfers.load(transferId).orElseThrow(() -> new TransferNotFoundException(transferId));
     }
 }

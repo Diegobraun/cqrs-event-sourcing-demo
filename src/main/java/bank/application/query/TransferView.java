@@ -4,10 +4,16 @@ import java.math.BigDecimal;
 import java.time.Instant;
 
 public record TransferView(String transferId, String sourceAccountId, String targetAccountId, BigDecimal amount,
-                           String status, String failureReason, Instant updatedAt) {
+                           String status, String failureReason, boolean refunded, Instant expiresAt,
+                           Instant updatedAt) {
 
     public TransferView advance(String newStatus, String reason, Instant at) {
         return new TransferView(transferId, sourceAccountId, targetAccountId, amount, newStatus,
-                reason == null ? failureReason : reason, at);
+                reason == null ? failureReason : reason, refunded, expiresAt, at);
+    }
+
+    public TransferView markRefunded(Instant at) {
+        return new TransferView(transferId, sourceAccountId, targetAccountId, amount, status, failureReason,
+                true, expiresAt, at);
     }
 }

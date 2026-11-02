@@ -71,3 +71,17 @@ call POST /transfers '{"transferId":"TR-3","sourceAccountId":"ACC-1","targetAcco
 sleep 0.5
 call GET /transfers/TR-3
 call GET /accounts/ACC-1/statement
+
+echo
+echo "--- 4. timeout: saga pausada, transferencia fica parada e expira (bank.transfer-timeout=10s) ---"
+call POST /admin/projections/transfer-saga/pause
+call POST /transfers '{"transferId":"TR-4","sourceAccountId":"ACC-1","targetAccountId":"ACC-2","amount":10}'
+sleep 0.5
+call GET /transfers/TR-4
+echo "aguardando o prazo de 10s..."
+sleep 12
+call GET /transfers/TR-4
+call POST /admin/projections/transfer-saga/resume
+sleep 0.5
+call GET /transfers/TR-4
+call GET /admin/projections

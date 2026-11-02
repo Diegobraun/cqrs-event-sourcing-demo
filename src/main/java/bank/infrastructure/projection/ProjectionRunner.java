@@ -25,8 +25,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public final class ProjectionRunner implements SmartLifecycle, ProjectionManager {
@@ -40,7 +43,9 @@ public final class ProjectionRunner implements SmartLifecycle, ProjectionManager
     private final CheckpointStore checkpoints;
     private final TransactionTemplate transaction;
     private final Duration pollInterval;
-    private final List<Worker> workers = new ArrayList<>();
+    private final Map<String, Worker> workers = new LinkedHashMap<>();
+    private final Set<String> paused = new HashSet<>();
+    private boolean running;
 
     public ProjectionRunner(MongoTemplate mongo, MongoEventMapper mapper, EventStore eventStore,
                             List<EventSubscriber> subscribers, CheckpointStore checkpoints,
@@ -56,25 +61,41 @@ public final class ProjectionRunner implements SmartLifecycle, ProjectionManager
 
     @Override
     public synchronized void start() {
-        if (!workers.isEmpty()) {
-            return;
-        }
-        for (EventSubscriber subscriber : subscribers) {
-            Worker worker = new Worker(subscriber);
-            workers.add(worker);
-            worker.thread.start();
-        }
+        running = true;
+        subscribers.stream()
+                .filter(subscriber -> !paused.contains(subscriber.name()))
+                .forEach(this::startWorker);
     }
 
     @Override
     public synchronized void stop() {
-        workers.forEach(Worker::stop);
+        running = false;
+        workers.values().forEach(Worker::stop);
         workers.clear();
     }
 
     @Override
     public synchronized boolean isRunning() {
-        return !workers.isEmpty();
+        return running;
+    }
+
+    @Override
+    public synchronized void pause(String subscriberName) {
+        EventSubscriber subscriber = subscriber(subscriberName);
+        paused.add(subscriber.name());
+        Worker worker = workers.remove(subscriber.name());
+        if (worker != null) {
+            worker.stop();
+        }
+    }
+
+    @Override
+    public synchronized void resume(String subscriberName) {
+        EventSubscriber subscriber = subscriber(subscriberName);
+        paused.remove(subscriber.name());
+        if (running) {
+            startWorker(subscriber);
+        }
     }
 
     @Override
@@ -83,7 +104,7 @@ public final class ProjectionRunner implements SmartLifecycle, ProjectionManager
         return subscribers.stream()
                 .map(subscriber -> {
                     long position = checkpoints.load(subscriber.name()).position();
-                    return new ProjectionStatus(subscriber.name(), position, last - position);
+                    return new ProjectionStatus(subscriber.name(), position, last - position, isActive(subscriber));
                 })
                 .toList();
     }
@@ -110,7 +131,7 @@ public final class ProjectionRunner implements SmartLifecycle, ProjectionManager
         Instant deadline = Instant.now().plus(timeout);
         while (lag() > 0) {
             if (Instant.now().isAfter(deadline)) {
-                throw new IllegalStateException("Projecoes nao alcancaram o event store em " + timeout);
+                throw new IllegalStateException("Assinantes ativos nao alcancaram o event store em " + timeout);
             }
             try {
                 Thread.sleep(10);
@@ -122,11 +143,35 @@ public final class ProjectionRunner implements SmartLifecycle, ProjectionManager
     }
 
     public long lag() {
-        return status().stream().mapToLong(ProjectionStatus::lag).max().orElse(0);
+        return status().stream()
+                .filter(ProjectionStatus::running)
+                .mapToLong(ProjectionStatus::lag)
+                .max()
+                .orElse(0);
     }
 
     public long checkpoint(String projectionName) {
         return checkpoints.load(projectionName).position();
+    }
+
+    private void startWorker(EventSubscriber subscriber) {
+        if (workers.containsKey(subscriber.name())) {
+            return;
+        }
+        Worker worker = new Worker(subscriber);
+        workers.put(subscriber.name(), worker);
+        worker.thread.start();
+    }
+
+    private synchronized boolean isActive(EventSubscriber subscriber) {
+        return workers.containsKey(subscriber.name());
+    }
+
+    private EventSubscriber subscriber(String name) {
+        return subscribers.stream()
+                .filter(candidate -> candidate.name().equals(name))
+                .findFirst()
+                .orElseThrow(() -> new ProjectionNotFoundException(name));
     }
 
     private final class Worker {

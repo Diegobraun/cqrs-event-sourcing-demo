@@ -245,10 +245,11 @@ A saída é a **saga**: quebrar a operação em passos locais, cada um numa cont
 
 | Peça | Papel |
 |---|---|
-| `Transfer` (aggregate) | Guarda o pedido e o resultado: `TransferRequested` → `TransferCompleted` ou `TransferFailed` |
+| `Transfer` (aggregate) | Guarda o pedido, o prazo e o resultado: `TransferRequested` → `TransferCreditStarted` → `TransferCompleted`, ou `TransferFailed` |
 | `Account` | Ganhou 3 operações: `debitForTransfer`, `creditForTransfer`, `reverseTransferDebit` |
 | `TransferSaga` | Escuta eventos e manda o próximo comando. Não guarda estado próprio: consulta o `Transfer` |
-| `TransferProjection` | Read model `transfer_view` no Postgres com o status visível (`REQUESTED`, `DEBITED`, `CREDITED`, `REVERSED`, `COMPLETED`, `FAILED`) |
+| `TransferProjection` | Read model `transfer_view` no Postgres: status (`REQUESTED`, `DEBITED`, `CREDITING`, `CREDITED`, `COMPLETED`, `FAILED`), motivo, prazo e se houve estorno (`refunded`) |
+| `TransferTimeoutScheduler` | A cada segundo, expira transferências paradas além do prazo |
 
 A saga roda no mesmo `ProjectionRunner` das projeções: ela é só mais um assinante do change stream, com seu próprio checkpoint (`transfer-saga`).
 
@@ -280,13 +281,15 @@ sequenceDiagram
     Note over T: TransferCompleted
 ```
 
+(Entre os passos 5 e 6 a saga ainda grava `TransferCreditStarted` na transferência; veja "Timeout" abaixo.)
+
 A requisição HTTP termina no passo 2. Tudo depois acontece em background, evento a evento. O cliente acompanha por `GET /transfers/TR-1`.
 
 ### Falha com compensação
 
 Se o débito falhar (saldo insuficiente), nada se moveu: a saga só marca `TransferFailed`.
 
-Se o **crédito** falhar (destino encerrado), o dinheiro já saiu da origem. A saga estorna:
+Se o **crédito** falhar (destino encerrado), o dinheiro já saiu da origem. A saga marca a falha e, ao ver o `TransferFailed`, estorna:
 
 ```mermaid
 sequenceDiagram
@@ -302,26 +305,86 @@ sequenceDiagram
     Note over A: TransferDebited (saldo -50)
 
     A--)S: evento TransferDebited
+    S->>T: startCredit()
+    Note over T: TransferCreditStarted (ponto de nao retorno)
     S->>B: CreditForTransfer(TR-3, 50)
     B--xS: recusado: conta nao esta aberta
-
-    S->>A: ReverseTransferDebit(TR-3, 50)
-    Note over A: TransferDebitReversed (saldo +50)
-
-    A--)S: evento TransferDebitReversed
     S->>T: fail(motivo)
     Note over T: TransferFailed
+
+    T--)S: evento TransferFailed
+    S->>A: ReverseTransferDebit(TR-3, 50)
+    Note over A: TransferDebitReversed (saldo +50)
 ```
 
-O histórico da conta de origem fica com as duas linhas, débito e estorno. Nada é apagado: o extrato mostra exatamente o que aconteceu.
+**Toda falha passa pelo mesmo caminho**: alguém grava `TransferFailed` (débito recusado, crédito recusado ou timeout) e a saga, ao ver esse evento, estorna a origem. Se não houve débito, o estorno é um no-op. Um único lugar de compensação, qualquer que seja o motivo.
 
-### As três regras que fazem a saga funcionar
+O histórico da conta de origem fica com as duas linhas, débito e estorno. Nada é apagado.
+
+### Timeout
+
+Se a saga travar (fora do ar, um evento que falha sempre), a transferência ficaria `REQUESTED` para sempre, talvez com o dinheiro já fora da origem. Cada `TransferRequested` carrega um prazo (`expiresAt`, configurado por `bank.transfer-timeout`). O `TransferTimeoutScheduler` roda a cada `bank.transfer-timeout-check-interval` e expira o que venceu:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Timeout (a cada 1s)
+    participant T as Transfer
+    participant S as TransferSaga
+    participant A as Conta origem
+
+    Note over T: TransferRequested (expiresAt = agora + 10s)
+    S->>A: DebitForTransfer
+    Note over A: TransferDebited
+    Note over S: saga trava aqui (fora do ar, erro, pausada)
+
+    W->>T: expire(agora)
+    Note over T: status REQUESTED e prazo vencido
+    Note over T: TransferFailed (Tempo esgotado)
+
+    Note over S: saga volta
+    T--)S: evento TransferDebited
+    S->>T: carrega: status FAILED
+    S->>A: ReverseTransferDebit
+    Note over A: TransferDebitReversed (dinheiro volta)
+```
+
+**Read model para descobrir, aggregate para decidir.** O scheduler busca candidatos em `transfer_view` (Postgres, barato de consultar), mas quem decide é o `Transfer` carregado do event store: `expire(now)` só falha a transferência se ela ainda está `REQUESTED` e o prazo venceu de verdade.
+
+**O ponto de não retorno.** O perigo do timeout é a corrida com a saga: se ele cancelasse no instante em que a saga credita o destino, o dinheiro chegaria ao destino de uma transferência "falha", e desfazer crédito pode ser impossível (o destino pode ter gastado). Por isso, antes de creditar, a saga grava `TransferCreditStarted` no stream da transferência:
+
+| Quem grava primeiro | O que acontece |
+|---|---|
+| Timeout (`TransferFailed`) | O `startCredit` da saga vê `FAILED` e não credita. Ao ver o `TransferFailed`, a saga estorna o débito |
+| Saga (`TransferCreditStarted`) | `expire` vê `CREDITING` e não faz nada. A transferência segue até `COMPLETED` (ou falha no crédito e estorna) |
+
+Os dois disputam o mesmo stream (`transfer-TR-x`) com concorrência otimista: nunca os dois vencem. Débito tardio (a saga debitou depois do timeout) não é problema: a saga vê `FAILED` e estorna.
+
+Para ver acontecendo (com a API rodando):
+
+```bash
+curl -X POST localhost:8080/admin/projections/transfer-saga/pause
+curl -X POST localhost:8080/transfers -H 'Content-Type: application/json' \
+     -d '{"transferId":"TR-9","sourceAccountId":"ACC-1","targetAccountId":"ACC-2","amount":10}'
+sleep 12
+curl localhost:8080/transfers/TR-9          # status FAILED, "Tempo esgotado"
+curl -X POST localhost:8080/admin/projections/transfer-saga/resume
+```
+
+O 10s é para a demo. Em produção o prazo seria de minutos e, na expiração, também se dispararia um alerta: transferência parada é sintoma de algo quebrado.
+
+### As regras que fazem a saga funcionar
 
 1. **Cada passo é idempotente.** O runner entrega eventos *pelo menos uma vez*: se cair depois de debitar e antes de salvar o checkpoint, o `TransferRequested` volta. Por isso `Account` guarda quais operações de transferência já aplicou (`debit:TR-1`, `credit:TR-1`, `reversal:TR-1`) e ignora repetição. Esse conjunto entra no snapshot.
-2. **A saga confere o estado antes de agir.** Só debita/credita se o `Transfer` ainda está `REQUESTED`. Sem isso, um replay de um `TransferRequested` antigo que falhou por saldo poderia debitar hoje, quando a conta já tem saldo.
+2. **A saga confere o estado antes de agir.** Só debita se o `Transfer` está `REQUESTED`; só credita depois de conseguir o `startCredit`. Sem isso, o replay de um `TransferRequested` antigo poderia debitar hoje uma transferência que já falhou.
 3. **Compensação não pode falhar.** `reverseTransferDebit` não exige conta aberta nem saldo: é a correção de algo que já aconteceu.
+4. **Existe um ponto de não retorno.** Antes dele, a transferência pode ser cancelada (por falha ou timeout) e estornada. Depois dele, só segue em frente.
 
-Erros técnicos (ex.: `ConcurrencyException` porque o cliente depositou na mesma conta no mesmo instante) fazem o runner **tentar o mesmo evento de novo** depois de um intervalo. Erros de negócio (`DomainException`) não são retentados: a saga os transforma em falha/compensação.
+Erros técnicos (ex.: `ConcurrencyException` porque o cliente depositou na mesma conta no mesmo instante) fazem o runner **tentar o mesmo evento de novo** depois de um intervalo. Erros de negócio (`DomainException`) não são retentados: a saga os transforma em `TransferFailed`.
+
+### Evolução de schema na prática
+
+`TransferRequested` ganhou o campo `expiresAt` depois que já existiam eventos gravados sem ele. Evento gravado nunca muda, então o código trata o campo ausente como "sem prazo" (`expire` ignora `expiresAt == null`). É a forma mais simples de versionamento: **campo novo opcional**, com um padrão seguro para eventos antigos.
 
 ## Endpoints
 
@@ -339,6 +402,8 @@ Erros técnicos (ex.: `ConcurrencyException` porque o cliente depositou na mesma
 | GET | `/transfers/{id}` | Consulta | `transfer_view` |
 | GET | `/admin/projections` | Operação | checkpoint e lag de cada projeção |
 | POST | `/admin/projections/{name}/rebuild` | Operação | apaga read model e reprocessa histórico |
+| POST | `/admin/projections/{name}/pause` | Operação | pausa um assinante (projeção ou saga) |
+| POST | `/admin/projections/{name}/resume` | Operação | retoma do checkpoint |
 
 `/events` é o único GET que lê do event store: serve para auditoria e para enxergar os fatos brutos. Consultas de produto devem ir para read models.
 
@@ -372,7 +437,7 @@ src/main/java/bank
 │   │   └── AccountStatus, AccountSnapshot
 │   └── transfer
 │       ├── Transfer                        aggregate root da transferência
-│       ├── TransferEvent (sealed)          TransferRequested, TransferCompleted, TransferFailed
+│       ├── TransferEvent (sealed)          TransferRequested, TransferCreditStarted, TransferCompleted, TransferFailed
 │       └── TransferStatus
 ├── application                             casos de uso + portas, ZERO Spring
 │   ├── eventstore
@@ -388,9 +453,11 @@ src/main/java/bank
 │   │   ├── AccountRepository               porta de persistência do aggregate
 │   │   └── CommandRejectedException        AccountNotFoundException, AccountAlreadyExistsException
 │   ├── transfer                            WRITE SIDE (transferência)
-│   │   ├── TransferCommandHandler          request, complete, fail
+│   │   ├── TransferCommandHandler          request, startCredit, complete, fail, expire
+│   │   ├── TransferTimeoutService          expira transferências vencidas
+│   │   ├── OverdueTransferFinder           porta: quem está vencido (implementada pelo read model)
 │   │   ├── TransferRepository              porta
-│   │   └── TransferSaga                    EventSubscriber que orquestra débito → crédito → conclusão/estorno
+│   │   └── TransferSaga                    EventSubscriber: débito → crédito → conclusão; estorna em qualquer falha
 │   └── query                               READ SIDE
 │       ├── AccountQueryService             consultas nos read models (+ checagem de minVersion)
 │       ├── AccountAuditService             histórico bruto do event store
@@ -401,7 +468,7 @@ src/main/java/bank
 │       └── projection
 │           ├── Projection                  EventSubscriber + reset (só projeções podem ser reconstruídas)
 │           ├── CheckpointStore, Checkpoint porta: até onde cada projeção leu (position + cursor opaco)
-│           ├── ProjectionManager           porta de operação: status, rebuild
+│           ├── ProjectionManager           porta de operação: status, rebuild, pause, resume
 │           ├── AccountSummaryProjection
 │           ├── StatementProjection
 │           └── TransferProjection
@@ -413,7 +480,9 @@ src/main/java/bank
     ├── persistence/EventSourcedTransferRepository          bean em ApplicationConfig
     ├── projection/ProjectionRunner                         SmartLifecycle; uma thread + change stream por assinante, com retry
     ├── projection/JdbcCheckpointStore                      @Repository (Postgres): position + resume token
+    ├── scheduling/TransferTimeoutScheduler                 @Scheduled: chama TransferTimeoutService
     └── readmodel/JdbcAccountSummaryStore, JdbcStatementStore, JdbcTransferViewStore   @Repository (Postgres)
+                                                            JdbcTransferViewStore também é o OverdueTransferFinder
 ```
 
 Regra de dependência:
@@ -489,6 +558,8 @@ Configuração em `application.yml` (além do datasource):
 bank:
   snapshot-every: 3
   projection-poll-interval: 50ms
+  transfer-timeout: 10s
+  transfer-timeout-check-interval: 1s
 ```
 
 ## Testes como roteiro
@@ -512,6 +583,10 @@ Cada conceito virou um teste em `src/test/java/bank`. Leia na ordem:
 | `TransferSagaTest.rejectedCreditIsCompensatedByReversingTheDebit` | Crédito recusado: estorno do débito (compensação) |
 | `TransferSagaTest.redeliveredEventsAndRepeatedCommandsAreIdempotent` | Reentregar eventos e repetir comandos não move dinheiro de novo |
 | `TransferSagaTest.transferToSameAccountIsRejectedUpFront` | Validação no aggregate `Transfer` |
+| `TransferTimeoutTest.transferNotYetDueIsLeftAlone` | Antes do prazo, nada acontece |
+| `TransferTimeoutTest.stuckTransferBeforeDebitFailsAndMovesNoMoney` | Saga parada antes do débito: falha sem mover dinheiro |
+| `TransferTimeoutTest.stuckTransferAfterDebitIsRefunded` | Saga parada depois do débito: falha e estorna |
+| `TransferTimeoutTest.timeoutDoesNotCancelTransferPastPointOfNoReturn` | Depois do `TransferCreditStarted`, o timeout não cancela; a transferência conclui |
 
 ## Pontos-chave no código
 
@@ -532,7 +607,7 @@ Cada conceito virou um teste em `src/test/java/bank`. Leia na ordem:
 - **Idempotência de comando**: header `Idempotency-Key` → `commandId` no comando e deduplicação no write side.
 - **Versionamento de eventos**: evento gravado nunca muda. Schema novo vira `MoneyDepositedV2` ou upcaster na leitura.
 - **Correção de erro**: não se apaga evento. Lança evento compensatório (`DepositReversed`).
-- **Sagas em produção**: timeout para transferências presas em `REQUESTED`, dead letter para eventos que falham sempre (aqui o retry é infinito), e o conjunto de operações aplicadas na conta precisaria de expurgo (cresce para sempre).
+- **Sagas em produção**: dead letter para eventos que falham sempre (aqui o retry é infinito), alerta quando o timeout dispara, e o conjunto de operações aplicadas na conta precisaria de expurgo (cresce para sempre).
 
 ## Quando usar
 
@@ -546,4 +621,4 @@ Não vale: CRUD simples, time sem experiência com consistência eventual, domí
 2. Header `Idempotency-Key` no `AccountCommandController` evitando depósito duplicado em retry do cliente.
 3. `DailyVolumeProjection` + endpoint `GET /reports/daily-volume`, populada via rebuild.
 4. Endpoint `GET /accounts/{id}/at/{version}` usando `loadAtVersion` (time travel via API).
-5. Timeout na saga: transferência em `REQUESTED` há mais de N segundos vira `TransferFailed` (e estorna se já debitou).
+5. Dead letter: depois de N tentativas de um mesmo evento, mover para uma coleção `dead_letters` e seguir em frente, com endpoint para reprocessar.

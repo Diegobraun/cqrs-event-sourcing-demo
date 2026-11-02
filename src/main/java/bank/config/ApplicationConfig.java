@@ -14,9 +14,11 @@ import bank.application.query.projection.AccountSummaryProjection;
 import bank.application.query.projection.CheckpointStore;
 import bank.application.query.projection.StatementProjection;
 import bank.application.query.projection.TransferProjection;
+import bank.application.transfer.OverdueTransferFinder;
 import bank.application.transfer.TransferCommandHandler;
 import bank.application.transfer.TransferRepository;
 import bank.application.transfer.TransferSaga;
+import bank.application.transfer.TransferTimeoutService;
 import bank.infrastructure.eventstore.MongoEventMapper;
 import bank.infrastructure.persistence.EventSourcedAccountRepository;
 import bank.infrastructure.persistence.EventSourcedTransferRepository;
@@ -26,12 +28,14 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 
 @Configuration
 @EnableConfigurationProperties(BankProperties.class)
+@EnableScheduling
 public class ApplicationConfig {
 
     @Bean
@@ -79,8 +83,14 @@ public class ApplicationConfig {
     }
 
     @Bean
-    TransferCommandHandler transferCommandHandler(TransferRepository transferRepository) {
-        return new TransferCommandHandler(transferRepository);
+    TransferCommandHandler transferCommandHandler(TransferRepository transferRepository, BankProperties properties) {
+        return new TransferCommandHandler(transferRepository, properties.transferTimeout());
+    }
+
+    @Bean
+    TransferTimeoutService transferTimeoutService(OverdueTransferFinder finder,
+                                                  TransferCommandHandler transferCommandHandler) {
+        return new TransferTimeoutService(finder, transferCommandHandler);
     }
 
     @Bean

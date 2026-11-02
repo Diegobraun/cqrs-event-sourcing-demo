@@ -10,6 +10,7 @@ import bank.domain.account.TransferDebitReversed;
 import bank.domain.account.TransferDebited;
 import bank.domain.shared.DomainEvent;
 import bank.domain.transfer.TransferCompleted;
+import bank.domain.transfer.TransferCreditStarted;
 import bank.domain.transfer.TransferFailed;
 import bank.domain.transfer.TransferRequested;
 import org.bson.Document;
@@ -31,6 +32,7 @@ public class MongoEventMapper {
             Map.entry("TransferCredited", TransferCredited.class),
             Map.entry("TransferDebitReversed", TransferDebitReversed.class),
             Map.entry("TransferRequested", TransferRequested.class),
+            Map.entry("TransferCreditStarted", TransferCreditStarted.class),
             Map.entry("TransferCompleted", TransferCompleted.class),
             Map.entry("TransferFailed", TransferFailed.class));
 

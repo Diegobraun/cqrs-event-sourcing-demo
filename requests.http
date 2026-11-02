@@ -51,3 +51,9 @@ GET http://localhost:8080/transfers/TR-1
 
 ### Eventos da conta de origem (ver TransferDebited / TransferDebitReversed)
 GET http://localhost:8080/accounts/ACC-1/events
+
+### Pausar a saga (para ver o timeout acontecer)
+POST http://localhost:8080/admin/projections/transfer-saga/pause
+
+### Retomar a saga
+POST http://localhost:8080/admin/projections/transfer-saga/resume

@@ -115,6 +115,7 @@ class TransferSagaTest {
 
         TransferView view = transferQueries.find("TR-3");
         assertThat(view.status()).isEqualTo("FAILED");
+        assertThat(view.refunded()).isTrue();
         List<StatementLine> statement = accountQueries.statement("T-E");
         assertThat(statement.getLast().description()).startsWith("Estorno");
         assertThat(statement.getLast().balanceAfter()).isEqualByComparingTo("1000");

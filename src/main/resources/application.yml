@@ -15,3 +15,5 @@ spring:
 bank:
   snapshot-every: 3
   projection-poll-interval: 50ms
+  transfer-timeout: 10s
+  transfer-timeout-check-interval: 1s
